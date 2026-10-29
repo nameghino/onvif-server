@@ -409,6 +409,10 @@ class OnvifServer {
             if (ptz.invert_pan_axis || ptz.invert_tilt_axis)
                 body = invertPanTilt(body, ptz.invert_pan_axis, ptz.invert_tilt_axis);
 
+            let operation = (body.match(/<(?:\w+:)?Body\b[^>]*>\s*<(?:\w+:)?(\w+)/) || [])[1] || 'unknown';
+            let requestBody = (body.match(/<(?:\w+:)?Body\b[^>]*>([\s\S]*?)<\/(?:\w+:)?Body>/) || [])[1] || '';
+            this.logger.info(`PTZ ${this.config.name}: ${operation} ${requestBody.replace(/\s+/g, ' ').substring(0, 400)}`);
+
             body = body.replace(/<(\w+:)?Header\b[^>]*\/>/, '')
                        .replace(/<(\w+:)?Header\b[^>]*>[\s\S]*?<\/\1Header>/, '')
                        .replace(/<((\w+:)?)Envelope\b[^>]*>/, (envelope, prefix) =>
@@ -425,8 +429,18 @@ class OnvifServer {
                     'Content-Length': Buffer.byteLength(body)
                 }
             }, (cameraResponse) => {
-                response.writeHead(cameraResponse.statusCode, { 'Content-Type': cameraResponse.headers['content-type'] || 'application/soap+xml; charset=utf-8' });
-                cameraResponse.pipe(response);
+                let reply = [];
+                cameraResponse.on('data', (chunk) => reply.push(chunk));
+                cameraResponse.on('end', () => {
+                    reply = Buffer.concat(reply);
+                    let text = reply.toString('utf8');
+                    let fault = (text.match(/<(?:\w+:)?Text\b[^>]*>([^<]*)</) || [])[1];
+                    let result = (text.match(/<(?:\w+:)?Body\b[^>]*>([\s\S]*?)<\/(?:\w+:)?Body>/) || [])[1] || '';
+                    this.logger.info(`PTZ ${this.config.name}: ${operation} -> HTTP ${cameraResponse.statusCode}` +
+                        (fault ? ` fault: ${fault}` : ` ${result.replace(/\s+/g, ' ').substring(0, 400)}`));
+                    response.writeHead(cameraResponse.statusCode, { 'Content-Type': cameraResponse.headers['content-type'] || 'application/soap+xml; charset=utf-8' });
+                    response.end(reply);
+                });
             });
             forward.on('timeout', () => forward.destroy(new Error('timed out')));
             forward.on('error', (error) => {
