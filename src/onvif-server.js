@@ -436,6 +436,10 @@ class OnvifServer {
 
             let contentType = request.headers['content-type'] || 'application/soap+xml; charset=utf-8';
             this.handlePtz(operation, body, contentType).then((reply) => {
+                // Positions reported back are inverted too, so a position the
+                // client stores and later moves to round-trips unchanged.
+                if (ptz.invert_pan_axis || ptz.invert_tilt_axis)
+                    reply.text = invertPanTilt(reply.text, ptz.invert_pan_axis, ptz.invert_tilt_axis);
                 let fault = faultText(reply.text);
                 let result = (reply.text.match(/<(?:\w+:)?Body\b[^>]*>([\s\S]*?)<\/(?:\w+:)?Body>/) || [])[1] || '';
                 this.logger.info(`PTZ ${this.config.name}: ${operation} -> HTTP ${reply.statusCode}` +
