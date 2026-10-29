@@ -39,6 +39,21 @@ function wsSecurityHeader(username, password) {
         `</UsernameToken></Security>`;
 }
 
+// Negates the x (pan) and/or y (tilt) of PanTilt vectors in move requests.
+// Only Velocity, Translation and Position are touched: the Speed vectors of
+// RelativeMove/AbsoluteMove are magnitudes and must stay positive.
+function invertPanTilt(body, invertPan, invertTilt) {
+    let negate = (value) => String(-parseFloat(value));
+    return body.replace(/<((\w+:)?)(Velocity|Translation|Position)\b[^>]*>[\s\S]*?<\/\1\3>/g, (vector) =>
+        vector.replace(/<(\w+:)?PanTilt\b[^>]*>/g, (panTilt) => {
+            if (invertPan)
+                panTilt = panTilt.replace(/(\sx=")([^"]*)(")/, (m, start, value, end) => start + negate(value) + end);
+            if (invertTilt)
+                panTilt = panTilt.replace(/(\sy=")([^"]*)(")/, (m, start, value, end) => start + negate(value) + end);
+            return panTilt;
+        }));
+}
+
 class OnvifServer {
     constructor(config, logger) {
         this.config = config;
@@ -390,6 +405,9 @@ class OnvifServer {
         request.on('end', () => {
             for (let [virtualToken, cameraToken] of Object.entries(ptz.profiles || {}))
                 body = body.split(`>${virtualToken}<`).join(`>${cameraToken}<`);
+
+            if (ptz.invert_pan_axis || ptz.invert_tilt_axis)
+                body = invertPanTilt(body, ptz.invert_pan_axis, ptz.invert_tilt_axis);
 
             body = body.replace(/<(\w+:)?Header\b[^>]*\/>/, '')
                        .replace(/<(\w+:)?Header\b[^>]*>[\s\S]*?<\/\1Header>/, '')

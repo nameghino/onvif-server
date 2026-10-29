@@ -127,6 +127,8 @@ If the real camera supports Onvif PTZ, add a `ptz` section to forward PTZ reques
         sub_stream: PROFILE_001
       configurationToken: PTZConfigurationToken  # optional, this is the default
       nodeToken: NODE_000                        # optional, this is the default
+      invert_pan_axis: false      # optional, true swaps left and right
+      invert_tilt_axis: false     # optional, true swaps up and down
 ```
 The virtual device then advertises a PTZ service and passes every PTZ request through to the real camera, re-signed with the credentials above. The real camera's profile, PTZ configuration and node tokens can be found with its `GetProfiles` and `GetNodes` responses.
 
