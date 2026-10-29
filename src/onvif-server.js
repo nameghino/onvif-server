@@ -39,6 +39,26 @@ function wsSecurityHeader(username, password) {
         `</UsernameToken></Security>`;
 }
 
+const PTZ_NAMESPACE = 'http://www.onvif.org/ver20/ptz/wsdl';
+const POSITION_PRESET_PREFIX = 'position-';
+// Positions are reported as pan x = 0.01 to 0.99, cycling with the preset number,
+// so they survive a client rounding them to two decimals.
+function positionX(number) {
+    return ((number - 1) % 99 + 1) / 100;
+}
+
+function soapEnvelope(body) {
+    return `<?xml version="1.0" encoding="UTF-8"?><s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"><s:Body>${body}</s:Body></s:Envelope>`;
+}
+
+function soapReply(body) {
+    return { statusCode: 200, contentType: 'application/soap+xml; charset=utf-8', text: soapEnvelope(body) };
+}
+
+function faultText(text) {
+    return (text.match(/<(?:\w+:)?Text\b[^>]*>([^<]*)</) || [])[1];
+}
+
 // Negates the x (pan) and/or y (tilt) of PanTilt vectors in move requests.
 // Only Velocity, Translation and Position are touched: the Speed vectors of
 // RelativeMove/AbsoluteMove are magnitudes and must stay positive.
@@ -396,7 +416,8 @@ class OnvifServer {
 
     // Forwards a PTZ request to the real camera: profile tokens are mapped to the
     // camera's own, and the client's WS-Security header is replaced by one signed
-    // with the camera's credentials. The camera's response is returned as-is.
+    // with the camera's credentials. The camera's response is returned as-is,
+    // except for the position emulation in handlePtz.
     proxyPtz(request, response) {
         let ptz = this.config.ptz;
         let body = '';
@@ -413,11 +434,101 @@ class OnvifServer {
             let requestBody = (body.match(/<(?:\w+:)?Body\b[^>]*>([\s\S]*?)<\/(?:\w+:)?Body>/) || [])[1] || '';
             this.logger.info(`PTZ ${this.config.name}: ${operation} ${requestBody.replace(/\s+/g, ' ').substring(0, 400)}`);
 
-            body = body.replace(/<(\w+:)?Header\b[^>]*\/>/, '')
-                       .replace(/<(\w+:)?Header\b[^>]*>[\s\S]*?<\/\1Header>/, '')
-                       .replace(/<((\w+:)?)Envelope\b[^>]*>/, (envelope, prefix) =>
-                           `${envelope}<${prefix}Header>${wsSecurityHeader(ptz.username, ptz.password)}</${prefix}Header>`);
+            let contentType = request.headers['content-type'] || 'application/soap+xml; charset=utf-8';
+            this.handlePtz(operation, body, contentType).then((reply) => {
+                let fault = faultText(reply.text);
+                let result = (reply.text.match(/<(?:\w+:)?Body\b[^>]*>([\s\S]*?)<\/(?:\w+:)?Body>/) || [])[1] || '';
+                this.logger.info(`PTZ ${this.config.name}: ${operation} -> HTTP ${reply.statusCode}` +
+                    (fault ? ` fault: ${fault}` : ` ${result.replace(/\s+/g, ' ').substring(0, 400)}`));
+                response.writeHead(reply.statusCode, { 'Content-Type': reply.contentType });
+                response.end(reply.text);
+            }, (error) => {
+                this.logger.error(`PTZ request to ${this.config.target.hostname} failed: ${error.message}`);
+                response.writeHead(502, {'Content-Type': 'text/plain'});
+                response.end();
+            });
+        });
+    }
 
+    // The camera can't report its position or move to one, so with
+    // emulate_positions the position a client reads is a stand-in: the current
+    // spot is saved as a "position-<n>" preset and reported as pan x = positionX(n).
+    // An AbsoluteMove to such a position becomes a GotoPreset to that preset.
+    async handlePtz(operation, body, contentType) {
+        let ptz = this.config.ptz;
+        if (!ptz.emulate_positions)
+            return this.sendToCamera(body, contentType);
+
+        let profileToken = (body.match(/ProfileToken>([^<]+)</) || [])[1];
+        if (['ContinuousMove', 'RelativeMove', 'AbsoluteMove', 'GotoPreset', 'GotoHomePosition'].includes(operation))
+            this.positionNumber = null;
+
+        if (operation == 'GetStatus') {
+            if (this.positionNumber == null)
+                this.positionNumber = await this.savePosition(profileToken);
+            let reply = await this.sendToCamera(body, contentType);
+            reply.text = reply.text.replace(/(<(?:\w+:)?Position\b[^>]*>[\s\S]*?<(?:\w+:)?PanTilt\b)([^>]*)/, (match, start, attributes) =>
+                start + attributes.replace(/\sx="[^"]*"/, ` x="${positionX(this.positionNumber)}"`).replace(/\sy="[^"]*"/, ' y="0"'));
+            return reply;
+        }
+
+        if (operation == 'AbsoluteMove') {
+            let position = (body.match(/<(?:\w+:)?Position\b[^>]*>[\s\S]*?<(?:\w+:)?PanTilt\b[^>]*\sx="([^"]*)"/) || [])[1];
+            let x = parseFloat(position);
+            let preset = x > 0 && (await this.positionPresets(profileToken)).find((p) => Math.abs(positionX(p.number) - x) < 0.005);
+            if (preset) {
+                this.logger.info(`PTZ ${this.config.name}: position ${preset.number} is preset ${preset.token}, sending GotoPreset`);
+                let reply = await this.cameraPtz(`<GotoPreset xmlns="${PTZ_NAMESPACE}"><ProfileToken>${profileToken}</ProfileToken><PresetToken>${preset.token}</PresetToken></GotoPreset>`);
+                if (reply.statusCode != 200)
+                    return reply;
+                this.positionNumber = preset.number;
+                return soapReply(`<tptz:AbsoluteMoveResponse xmlns:tptz="${PTZ_NAMESPACE}"/>`);
+            }
+            this.logger.info(`PTZ ${this.config.name}: position x=${position} is not a saved position, forwarding AbsoluteMove`);
+        }
+
+        return this.sendToCamera(body, contentType);
+    }
+
+    // Saves the camera's current spot as a new "position-<n>" preset, reusing the
+    // oldest one once `position_presets` of them exist. Returns n.
+    async savePosition(profileToken) {
+        let presets = (await this.positionPresets(profileToken)).sort((a, b) => a.number - b.number);
+        let number = presets.length ? presets[presets.length - 1].number + 1 : 1;
+        // Capped below 99 so the cycling positionX values stay unique.
+        let reuse = presets.length >= Math.min(this.config.ptz.position_presets || 20, 98) ? presets[0] : null;
+        let reply = await this.cameraPtz(`<SetPreset xmlns="${PTZ_NAMESPACE}"><ProfileToken>${profileToken}</ProfileToken>` +
+            `<PresetName>${POSITION_PRESET_PREFIX}${number}</PresetName>${reuse ? `<PresetToken>${reuse.token}</PresetToken>` : ''}</SetPreset>`);
+        if (reply.statusCode != 200)
+            throw new Error(`saving position failed: ${faultText(reply.text)}`);
+        let token = (reply.text.match(/PresetToken>([^<]+)</) || [])[1];
+        this.logger.info(`PTZ ${this.config.name}: saved position ${number} as preset ${token}`);
+        return number;
+    }
+
+    async positionPresets(profileToken) {
+        let reply = await this.cameraPtz(`<GetPresets xmlns="${PTZ_NAMESPACE}"><ProfileToken>${profileToken}</ProfileToken></GetPresets>`);
+        let presets = [];
+        let pattern = new RegExp(`<(?:\\w+:)?Preset\\b[^>]*\\stoken="([^"]+)"[^>]*>\\s*<(?:\\w+:)?Name>${POSITION_PRESET_PREFIX}(\\d+)<`, 'g');
+        for (let match of reply.text.matchAll(pattern))
+            presets.push({ token: match[1], number: Number(match[2]) });
+        return presets;
+    }
+
+    cameraPtz(operation) {
+        return this.sendToCamera(soapEnvelope(operation), 'application/soap+xml; charset=utf-8');
+    }
+
+    // POSTs a SOAP envelope to the camera's PTZ service, signed with the camera's
+    // credentials in place of whatever header it had.
+    sendToCamera(envelope, contentType) {
+        let ptz = this.config.ptz;
+        envelope = envelope.replace(/<(\w+:)?Header\b[^>]*\/>/, '')
+                           .replace(/<(\w+:)?Header\b[^>]*>[\s\S]*?<\/\1Header>/, '')
+                           .replace(/<((\w+:)?)Envelope\b[^>]*>/, (open, prefix) =>
+                               `${open}<${prefix}Header>${wsSecurityHeader(ptz.username, ptz.password)}</${prefix}Header>`);
+
+        return new Promise((resolve, reject) => {
             let forward = http.request({
                 host: this.config.target.hostname,
                 port: ptz.port || 80,
@@ -425,31 +536,21 @@ class OnvifServer {
                 method: 'POST',
                 timeout: 10000,
                 headers: {
-                    'Content-Type': request.headers['content-type'] || 'application/soap+xml; charset=utf-8',
-                    'Content-Length': Buffer.byteLength(body)
+                    'Content-Type': contentType,
+                    'Content-Length': Buffer.byteLength(envelope)
                 }
             }, (cameraResponse) => {
                 let reply = [];
                 cameraResponse.on('data', (chunk) => reply.push(chunk));
-                cameraResponse.on('end', () => {
-                    reply = Buffer.concat(reply);
-                    let text = reply.toString('utf8');
-                    let fault = (text.match(/<(?:\w+:)?Text\b[^>]*>([^<]*)</) || [])[1];
-                    let result = (text.match(/<(?:\w+:)?Body\b[^>]*>([\s\S]*?)<\/(?:\w+:)?Body>/) || [])[1] || '';
-                    this.logger.info(`PTZ ${this.config.name}: ${operation} -> HTTP ${cameraResponse.statusCode}` +
-                        (fault ? ` fault: ${fault}` : ` ${result.replace(/\s+/g, ' ').substring(0, 400)}`));
-                    response.writeHead(cameraResponse.statusCode, { 'Content-Type': cameraResponse.headers['content-type'] || 'application/soap+xml; charset=utf-8' });
-                    response.end(reply);
-                });
+                cameraResponse.on('end', () => resolve({
+                    statusCode: cameraResponse.statusCode,
+                    contentType: cameraResponse.headers['content-type'] || 'application/soap+xml; charset=utf-8',
+                    text: Buffer.concat(reply).toString('utf8')
+                }));
             });
             forward.on('timeout', () => forward.destroy(new Error('timed out')));
-            forward.on('error', (error) => {
-                this.logger.error(`PTZ request to ${this.config.target.hostname} failed: ${error.message}`);
-                if (!response.headersSent)
-                    response.writeHead(502, {'Content-Type': 'text/plain'});
-                response.end();
-            });
-            forward.end(body);
+            forward.on('error', reject);
+            forward.end(envelope);
         });
     }
 

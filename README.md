@@ -129,7 +129,11 @@ If the real camera supports Onvif PTZ, add a `ptz` section to forward PTZ reques
       nodeToken: NODE_000                        # optional, this is the default
       invert_pan_axis: false      # optional, true swaps left and right
       invert_tilt_axis: false     # optional, true swaps up and down
+      emulate_positions: false    # optional, see below
+      position_presets: 20        # optional, max presets used by emulate_positions
 ```
+
+Some cameras can't report their position (they always answer 0, 0) or move to one, which breaks clients that store a position and later move back to it, like UniFi Protect's "home". With `emulate_positions: true`, asking for the position after a move saves the camera's current spot as a preset named `position-<n>` and reports it as a pan of `0.01`–`0.99`; an `AbsoluteMove` to one of those values becomes a `GotoPreset` to that preset. At most `position_presets` (up to 98) such presets are kept, the oldest being reused first, and other presets are left alone.
 The virtual device then advertises a PTZ service and passes every PTZ request through to the real camera, re-signed with the credentials above. The real camera's profile, PTZ configuration and node tokens can be found with its `GetProfiles` and `GetNodes` responses.
 
 ## Start Virtual Onvif Servers
