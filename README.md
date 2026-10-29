@@ -114,6 +114,22 @@ onvif:
 
 The above configuration creates a virtual Onvif device that listens on port 8081 of the `a2:a2:a2:a2:a2:a1` virtual network and forwards the RTSP video streams and snapshots from `192.168.1.152` (the real Onvif server).
 
+## PTZ
+If the real camera supports Onvif PTZ, add a `ptz` section to forward PTZ requests to it:
+```yaml
+    ptz:
+      port: 8899                  # Onvif port of the real camera
+      path: /onvif/ptz_service    # optional, this is the default
+      username: admin
+      password: secret
+      profiles:                   # virtual profile token -> real camera profile token
+        main_stream: PROFILE_000
+        sub_stream: PROFILE_001
+      configurationToken: PTZConfigurationToken  # optional, this is the default
+      nodeToken: NODE_000                        # optional, this is the default
+```
+The virtual device then advertises a PTZ service and passes every PTZ request through to the real camera, re-signed with the credentials above. The real camera's profile, PTZ configuration and node tokens can be found with its `GetProfiles` and `GetNodes` responses.
+
 ## Start Virtual Onvif Servers
 Finally, to start the virtual Onvif devices run:
 ```bash

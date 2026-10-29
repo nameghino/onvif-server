@@ -1,5 +1,6 @@
 const soap = require('soap');
 const http = require('http');
+const crypto = require('crypto');
 const dgram = require('dgram');
 const xml2js = require('xml2js');
 const uuid = require('node-uuid');
@@ -24,6 +25,18 @@ function getIpAddressFromMac(macAddress) {
             if (network.family == 'IPv4' && network.mac.toLowerCase() == macAddress.toLowerCase())
                 return network.address;
     return null;
+}
+
+function wsSecurityHeader(username, password) {
+    let nonce = crypto.randomBytes(16);
+    let created = new Date().toISOString().replace(/\.\d+Z$/, 'Z');
+    let digest = crypto.createHash('sha1').update(Buffer.concat([nonce, Buffer.from(created + password)])).digest('base64');
+    return `<Security xmlns="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd">` +
+        `<UsernameToken><Username>${username}</Username>` +
+        `<Password Type="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-username-token-profile-1.0#PasswordDigest">${digest}</Password>` +
+        `<Nonce EncodingType="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-soap-message-security-1.0#Base64Binary">${nonce.toString('base64')}</Nonce>` +
+        `<Created xmlns="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd">${created}</Created>` +
+        `</UsernameToken></Security>`;
 }
 
 class OnvifServer {
@@ -125,7 +138,25 @@ class OnvifServer {
                 }
             );
         }
-        
+
+        // PTZ is passed through to the real camera; the profiles only need to
+        // reference its PTZ configuration so clients know PTZ is available.
+        if (this.config.ptz) {
+            for (let profile of this.profiles) {
+                profile.PTZConfiguration = {
+                    attributes: {
+                        token: this.config.ptz.configurationToken || 'PTZConfigurationToken'
+                    },
+                    Name: 'PTZConfiguration',
+                    UseCount: this.profiles.length,
+                    NodeToken: this.config.ptz.nodeToken || 'NODE_000',
+                    DefaultContinuousPanTiltVelocitySpace: 'http://www.onvif.org/ver10/tptz/PanTiltSpaces/VelocityGenericSpace',
+                    DefaultContinuousZoomVelocitySpace: 'http://www.onvif.org/ver10/tptz/ZoomSpaces/VelocityGenericSpace',
+                    DefaultPTZTimeout: 'PT5S'
+                };
+            }
+        }
+
         this.onvif = {
             DeviceService: {
                 Device: {
@@ -240,30 +271,46 @@ class OnvifServer {
                                 }
                             }
                         }
+                        if (this.config.ptz && (args.Category === undefined || args.Category == 'All' || args.Category == 'PTZ')) {
+                            response.Capabilities['PTZ'] = {
+                                XAddr: `http://${this.config.hostname}:${this.config.ports.server}/onvif/ptz_service`
+                            };
+                        }
 
                         return response;
                     },
         
                     GetServices: (args) => {
-                        return {
-                            Service : [
-                                {
-                                    Namespace : 'http://www.onvif.org/ver10/device/wsdl',
-                                    XAddr : `http://${this.config.hostname}:${this.config.ports.server}/onvif/device_service`,
-                                    Version : { 
-                                        Major : 2,
-                                        Minor : 5,
-                                    }
-                                },
-                                { 
-                                    Namespace : 'http://www.onvif.org/ver10/media/wsdl',
-                                    XAddr : `http://${this.config.hostname}:${this.config.ports.server}/onvif/media_service`,
-                                    Version : { 
-                                        Major : 2,
-                                        Minor : 5,
-                                    }
+                        let services = [
+                            {
+                                Namespace : 'http://www.onvif.org/ver10/device/wsdl',
+                                XAddr : `http://${this.config.hostname}:${this.config.ports.server}/onvif/device_service`,
+                                Version : { 
+                                    Major : 2,
+                                    Minor : 5,
                                 }
-                            ]
+                            },
+                            { 
+                                Namespace : 'http://www.onvif.org/ver10/media/wsdl',
+                                XAddr : `http://${this.config.hostname}:${this.config.ports.server}/onvif/media_service`,
+                                Version : {
+                                    Major : 2,
+                                    Minor : 5,
+                                }
+                            }
+                        ];
+                        if (this.config.ptz) {
+                            services.push({
+                                Namespace : 'http://www.onvif.org/ver20/ptz/wsdl',
+                                XAddr : `http://${this.config.hostname}:${this.config.ports.server}/onvif/ptz_service`,
+                                Version : {
+                                    Major : 2,
+                                    Minor : 5,
+                                }
+                            });
+                        }
+                        return {
+                            Service : services
                         };
                     },
                 
@@ -332,9 +379,53 @@ class OnvifServer {
         };
     }
 
+    // Forwards a PTZ request to the real camera: profile tokens are mapped to the
+    // camera's own, and the client's WS-Security header is replaced by one signed
+    // with the camera's credentials. The camera's response is returned as-is.
+    proxyPtz(request, response) {
+        let ptz = this.config.ptz;
+        let body = '';
+        request.setEncoding('utf8');
+        request.on('data', (chunk) => body += chunk);
+        request.on('end', () => {
+            for (let [virtualToken, cameraToken] of Object.entries(ptz.profiles || {}))
+                body = body.split(`>${virtualToken}<`).join(`>${cameraToken}<`);
+
+            body = body.replace(/<(\w+:)?Header\b[^>]*\/>/, '')
+                       .replace(/<(\w+:)?Header\b[^>]*>[\s\S]*?<\/\1Header>/, '')
+                       .replace(/<((\w+:)?)Envelope\b[^>]*>/, (envelope, prefix) =>
+                           `${envelope}<${prefix}Header>${wsSecurityHeader(ptz.username, ptz.password)}</${prefix}Header>`);
+
+            let forward = http.request({
+                host: this.config.target.hostname,
+                port: ptz.port || 80,
+                path: ptz.path || '/onvif/ptz_service',
+                method: 'POST',
+                timeout: 10000,
+                headers: {
+                    'Content-Type': request.headers['content-type'] || 'application/soap+xml; charset=utf-8',
+                    'Content-Length': Buffer.byteLength(body)
+                }
+            }, (cameraResponse) => {
+                response.writeHead(cameraResponse.statusCode, { 'Content-Type': cameraResponse.headers['content-type'] || 'application/soap+xml; charset=utf-8' });
+                cameraResponse.pipe(response);
+            });
+            forward.on('timeout', () => forward.destroy(new Error('timed out')));
+            forward.on('error', (error) => {
+                this.logger.error(`PTZ request to ${this.config.target.hostname} failed: ${error.message}`);
+                if (!response.headersSent)
+                    response.writeHead(502, {'Content-Type': 'text/plain'});
+                response.end();
+            });
+            forward.end(body);
+        });
+    }
+
     listen(request, response) {
         let action = url.parse(request.url, true).pathname;
-        if (action == '/snapshot.png') {
+        if (action == '/onvif/ptz_service' && this.config.ptz) {
+            this.proxyPtz(request, response);
+        } else if (action == '/snapshot.png') {
             let image = fs.readFileSync('./resources/snapshot.png');
             response.writeHead(200, {'Content-Type': 'image/png' });
             response.end(image, 'binary');
@@ -346,7 +437,7 @@ class OnvifServer {
     }
 
     startServer() {
-        this.server = http.createServer(this.listen);
+        this.server = http.createServer(this.listen.bind(this));
 
         this.server.listen(this.config.ports.server, this.config.hostname);
 
